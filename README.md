@@ -29,7 +29,6 @@ Vue3 + TypeScript 前端 · FastAPI 后端 · 自研 Agent Runtime（function ca
 - [🔌 API](#-api)
 - [🧪 测试](#-测试)
 - [🔀 双后端：REST 直连 / MCP](#-双后端rest-直连--mcp)
-- [🆚 与 HelloAgents 版的差异](#-与-helloagents-版的差异)
 - [⚠️ 已知限制](#️-已知限制)
 - [🗺️ Roadmap](#️-roadmap)
 - [🤝 贡献指南](#-贡献指南)
