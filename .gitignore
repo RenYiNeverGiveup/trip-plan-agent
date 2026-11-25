@@ -1,0 +1,53 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pypackages__/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# ===== Node =====
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+# ===== 环境变量(含密钥, 严禁提交) =====
+# 注意: 必须写成 .env.* 而不是 .env.local,
+# 否则 .env.production / .env.staging 这类文件会被误提交。
+.env
+.env.*
+!.env.example
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ===== 日志 =====
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== 本地数据 =====
+*.sqlite3
+*.db
+uploads/
