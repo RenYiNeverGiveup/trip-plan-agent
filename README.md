@@ -28,6 +28,7 @@ Vue3 + TypeScript 前端 · FastAPI 后端 · 自研 Agent Runtime（function ca
 - [⚙️ 配置项](#️-配置项)
 - [🔌 API](#-api)
 - [🧪 测试](#-测试)
+- [🪵 日志](#-日志)
 - [🔀 双后端：REST 直连 / MCP](#-双后端rest-直连--mcp)
 - [⚠️ 已知限制](#️-已知限制)
 - [🗺️ Roadmap](#️-roadmap)
@@ -49,7 +50,8 @@ Vue3 + TypeScript 前端 · FastAPI 后端 · 自研 Agent Runtime（function ca
 | ⚡ **并行编排** | 景点 / 住宿 / 天气三路并发采集，每日餐厅按天并发检索；单点失败自动降级，不影响整体 |
 | 🧱 **双后端可切换** | 默认直连高德 Web 服务（零外部进程），也可用官方 MCP SDK 连接 `amap-mcp-server`，连接失败自动回落 |
 | 🪶 **无框架依赖** | 不引入 LangChain / LlamaIndex / HelloAgents，只依赖 `openai` + `httpx` |
-| 🧪 **可离线测试** | 32 个 pytest 用例，用假 LLM / 假高德跑通完整流水线，无需网络与 API Key |
+| 🗺️ **地图双路径渲染** | 有高德 JS API Key 时用交互地图；没有时自动回退到高德栅格瓦片自绘底图 + 标注/路线，景点地图永不空白 |
+| 🧪 **可离线测试** | 36 个 pytest 用例，用假 LLM / 假高德跑通完整流水线，无需网络与 API Key |
 
 ---
 
@@ -231,10 +233,11 @@ trip-plan-agent/
 │   │   ├── models/schemas.py         # Pydantic 数据契约
 │   │   ├── api/                      # FastAPI 路由
 │   │   └── config.py                 # 环境变量配置
-│   ├── tests/                        # pytest 用例（32 个）
+│   ├── tests/                        # pytest 用例（36 个）
 │   ├── pytest.ini
 │   └── requirements.txt
-├── frontend/                         # Vue3 + TS + Vite + Ant Design Vue + 高德 JS API
+├── frontend/                         # Vue3 + TS + Vite + Ant Design Vue + 高德地图
+│   └── src/components/TileMap.vue    #   栅格瓦片地图（无 JS API Key 时的兜底渲染）
 └── README.md
 ```
 
@@ -253,6 +256,7 @@ trip-plan-agent/
 | --- | --- | --- | --- |
 | LLM | 任意 OpenAI 兼容服务（OpenAI / DeepSeek / 通义 / Kimi） | 规划与描述 | 必需 |
 | 高德地图 Web 服务 | <https://console.amap.com/> | POI / 天气 / 路径规划 | 必需 |
+| 高德地图 Web 端（JS API） | <https://console.amap.com/dev/key/app> | 前端交互式地图 | 可选（未配置时自动回退为栅格瓦片地图） |
 | Unsplash | <https://unsplash.com/developers> | 景点配图 | 可选 |
 
 ### 3. 启动后端
@@ -282,7 +286,14 @@ npm run dev
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `VITE_API_BASE_URL` | `http://localhost:8000` | 后端 API 地址 |
-| `VITE_AMAP_WEB_JS_KEY` | - | 高德 Web 端（JS API）Key，用于前端地图展示 |
+| `VITE_AMAP_WEB_JS_KEY` | - | 高德 Web 端（JS API）Key，用于前端交互式地图 |
+
+> **地图说明**：前端「景点地图」有两条渲染路径。
+> 1. 配置了 `VITE_AMAP_WEB_JS_KEY` → 使用高德 JS API 交互地图（Marker / Polyline / InfoWindow）。
+> 2. 未配置 → 自动回退到 `frontend/src/components/TileMap.vue`：用高德**栅格瓦片**（`webrd0*.is.autonavi.com/appmaptile`，无需 Key）自行拼接底图，
+>    再按标准 Web 墨卡托投影把景点标注与每日路线绘制在瓦片上（与高德瓦片坐标系一致，标注不会偏移）。
+>
+> 两种路径下底图数据均来自高德，切换只影响交互能力，不影响“事实来自高德 API”的原则。
 
 ### 5. 运行测试
 
@@ -372,6 +383,27 @@ python -m pytest -v          # 查看每个用例
 | `test_route_optimizer.py` | 最近邻 + 2-opt 的顺序正确性与距离最优性 |
 | `test_budget_and_transport.py` | 预算各项之和恒等于总额、交通成本/耗时模型 |
 | `test_mcp_amap.py` | MCP 工具名规范化、结果解析、未连接时回落 REST |
+| `test_weather_service.py` | 高德天气 `casts` 字段解析、负温度保留、日期对齐 |
+
+---
+
+## 🪵 日志
+
+统一日志格式，**精确到"哪个类的哪一行"**：
+
+```
+2026-11-27 11:29:15.734 | INFO  | app.agents.trip_planner_agent | MultiAgentTripPlanner | trip_planner_agent.py:186 | plan_trip | 阶段C/D完成 耗时=38.4s 每日景点数=[3, 3]
+                          级别    logger 名                        类名                       文件:行号                 函数名     消息
+```
+
+- 类名由 `app/logging_config.py` 的 `ClassNameFilter` 在日志调用时回溯调用栈得到，**不需要改动任何 `logger.info(...)` 调用点**
+- 第三方 API 的入参/出参全部打印（高德、LLM、MCP），`key` / `token` / `secret` / `Authorization` 一律脱敏为 `***`
+- 控制台与滚动文件双输出，文件位于 `backend/logs/app.log`（10MB × 5 份）
+- `LOG_LEVEL=DEBUG` 可打印更完整的第三方响应体
+
+| 配置项 | 说明 |
+| --- | --- |
+| `LOG_LEVEL` | `INFO`(默认) / `DEBUG`（打印完整出入参）/ `WARNING` |
 
 ---
 
@@ -389,6 +421,28 @@ python -m pytest -v          # 查看每个用例
 
 ---
 
+
+## 🗺️ 高德接口对照
+
+后端直连高德 Web 服务（<https://lbs.amap.com/api/webservice/guide/api/direction>），接口与参数如下：
+
+| 能力 | 接口 | 关键参数 |
+| --- | --- | --- |
+| 关键字搜索 POI | `/v3/place/text` | `keywords` `city` `citylimit` `offset` `extensions=all` |
+| 周边 POI | `/v3/place/around` | `location` `keywords` `radius` `offset` |
+| POI 详情 | `/v3/place/detail` | `id` `extensions=all`（取 `biz_ext.ticket_price` 与 `photos`） |
+| 天气 | `/v3/weather/weatherInfo` | `city` `extensions=all`（逐日数组字段为 `casts`，不是 `forecast`） |
+| 地理编码 | `/v3/geocode/geo` | `address` `city` |
+| 步行路径 | `/v3/direction/walking` | `origin` `destination`，已知 POI 时附 `origin_id` / `destination_id` 提高匹配精度 |
+| 驾车路径 | `/v3/direction/driving` | 必填 `extensions=base`，`strategy=10`（躲避拥堵且路程较短） |
+| 公交路径 | `/v3/direction/transit/integrated` | 必填 `city`，`strategy=0`；距离需自行累加 `segments[].walking/bus/railway.distance` |
+
+> 旧的 `/v3/direction/transit` 已废弃，会返回 `INSUFFICIENT_PRIVILEGES`（10012）；改用 `/v3/direction/transit/integrated` 后可正常返回。
+> 业务错误（`status != 1`，如权限不足、参数非法）不参与重试，只有网络类错误才重试 3 次。
+
+前端底图使用高德栅格瓦片 `https://webrd0{1-4}.is.autonavi.com/appmaptile`（无需 Key），标注按标准 Web 墨卡托投影计算，与瓦片坐标系一致。
+
+---
 
 ## ⚠️ 已知限制
 
@@ -429,5 +483,5 @@ python -m pytest -v          # 查看每个用例
 ---
 
 <div align="center">
-  <sub>Made with ❤️ · 自研 Agent 运行时 · 无框架依赖</sub>
+  <sub>Made with ❤️ · 自研 Agent Runtime · 无框架依赖</sub>
 </div>

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from ..logging_config import Timer, log_llm_request, log_llm_response
 from .types import ChatMessage, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -109,16 +110,56 @@ class LLMClient:
     async def _request(self, request: Dict[str, Any]) -> Any:
         """带指数退避重试的请求。"""
         last_error: Optional[Exception] = None
+        model = str(request.get("model", ""))
         for attempt in range(self.max_retries + 1):
+            timer = Timer()
+            log_llm_request(
+                logger,
+                model,
+                request.get("messages"),
+                request.get("tools"),
+                extra={
+                    "attempt": attempt + 1,
+                    "max_attempts": self.max_retries + 1,
+                    "temperature": request.get("temperature"),
+                    "response_format": request.get("response_format"),
+                },
+            )
             try:
-                return await self._client.chat.completions.create(**request)
+                response = await self._client.chat.completions.create(**request)
             except Exception as exc:  # noqa: BLE001 - 需要按 provider 异常类型区分
                 last_error = exc
+                logger.error(
+                    "LLM 调用失败(%s/%s) elapsed=%.0fms: %s",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    timer.elapsed_ms,
+                    exc,
+                )
                 if not self._is_retryable(exc) or attempt == self.max_retries:
                     break
                 delay = min(2 ** attempt, 8)
                 logger.warning("LLM 调用失败(%s/%s): %s, %.1fs 后重试", attempt + 1, self.max_retries + 1, exc, delay)
                 await asyncio.sleep(delay)
+                continue
+
+            try:
+                message = response.choices[0].message
+                tool_calls = [
+                    {"name": call.function.name, "arguments": call.function.arguments}
+                    for call in (getattr(message, "tool_calls", None) or [])
+                ]
+                log_llm_response(
+                    logger,
+                    model,
+                    content=getattr(message, "content", None),
+                    tool_calls=tool_calls,
+                    usage=getattr(response, "usage", None),
+                    elapsed_ms=timer.elapsed_ms,
+                )
+            except Exception as exc:  # noqa: BLE001 - 日志失败不能影响主流程
+                logger.debug("打印 LLM 响应日志失败: %s", exc)
+            return response
         raise LLMError(f"LLM 调用失败: {last_error}") from last_error
 
     @staticmethod

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
+from ..logging_config import dumps
 from .llm import LLMClient, LLMError
 from .registry import ToolRegistry
 from .types import ChatMessage, ToolCall
@@ -141,13 +142,21 @@ class Agent:
         if spec is None:
             content = f"错误: 不存在名为 {call.name} 的工具, 可用工具: {self.tools.list_tools()}"
         else:
+            logger.info("→ 工具调用 %s args=%s", call.name, dumps(call.arguments, 500))
             try:
                 value = spec.handler(**call.arguments)
                 if inspect.isawaitable(value):
                     value = await value
                 content = json.dumps(value, ensure_ascii=False, default=str)
+                logger.info(
+                    "← 工具返回 %s elapsed=%.0fms result=%s",
+                    call.name,
+                    (time.perf_counter() - started) * 1000,
+                    dumps(value, 800),
+                )
             except TypeError as exc:
                 content = f"错误: 工具 {call.name} 参数不合法: {exc}"
+                logger.warning("工具 %s 参数不合法: %s", call.name, exc)
             except Exception as exc:  # noqa: BLE001 - 工具异常需回传给模型自行纠正
                 logger.warning("工具 %s 执行失败: %s", call.name, exc)
                 content = f"错误: 工具 {call.name} 执行失败: {exc}"

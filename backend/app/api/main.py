@@ -6,16 +6,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..config import get_settings, print_config, validate_config
+from ..logging_config import setup_logging
 from .routes import map as map_routes, poi, trip
 
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-)
+# 统一日志格式: 时间 | 级别 | logger | 类名 | 文件:行号 | 函数 | 消息
+setup_logging(level=settings.log_level)
 
 app = FastAPI(
     title=settings.app_name,

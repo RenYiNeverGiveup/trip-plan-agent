@@ -111,7 +111,19 @@
           <!-- 右侧:地图 -->
           <div class="right-map">
             <a-card id="map" title="📍 景点地图" :bordered="false" class="map-card">
-              <div id="amap-container" style="width: 100%; height: 100%"></div>
+              <div id="amap-container" class="amap-container" v-show="useJsMap"></div>
+              <TileMap
+                v-if="!useJsMap && mapPoints.length"
+                class="tile-map-wrapper"
+                :points="mapPoints"
+              />
+              <a-alert
+                v-if="mapError"
+                class="map-alert"
+                :type="useJsMap ? 'warning' : 'info'"
+                show-icon
+                :message="mapError"
+              />
             </a-card>
           </div>
         </div>
@@ -196,7 +208,7 @@
                       <!-- 景点图片 -->
                       <div class="attraction-image-wrapper">
                         <img
-                          :src="getAttractionImage(item.name, index)"
+                          :src="getAttractionImage(item, index)"
                           :alt="item.name"
                           class="attraction-image"
                           @error="handleImageError"
@@ -318,7 +330,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, onMounted, nextTick, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { DownOutlined } from '@ant-design/icons-vue'
@@ -326,6 +338,8 @@ import AMapLoader from '@amap/amap-jsapi-loader'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
 import type { TripPlan } from '@/types'
+import { API_BASE_URL } from '@/services/api'
+import TileMap from '@/components/TileMap.vue'
 
 const router = useRouter()
 const tripPlan = ref<TripPlan | null>(null)
@@ -334,7 +348,29 @@ const originalPlan = ref<TripPlan | null>(null)
 const attractionPhotos = ref<Record<string, string>>({})
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
+const mapError = ref('')
+// 配置了高德 Web端(JS API) Key 才使用交互式 JS 地图, 否则回退到栅格瓦片地图
+const useJsMap = ref(!!import.meta.env.VITE_AMAP_WEB_JS_KEY)
 let map: any = null
+
+// 地图需要的景点坐标(按行程顺序)
+const mapPoints = computed(() => {
+  if (!tripPlan.value) return []
+  const points: any[] = []
+  tripPlan.value.days.forEach((day, dayIndex) => {
+    day.attractions.forEach((attraction) => {
+      if (attraction.location && attraction.location.longitude && attraction.location.latitude) {
+        points.push({
+          name: attraction.name,
+          longitude: attraction.location.longitude,
+          latitude: attraction.location.latitude,
+          dayIndex
+        })
+      }
+    })
+  })
+  return points
+})
 
 onMounted(async () => {
   const data = sessionStorage.getItem('tripPlan')
@@ -442,10 +478,13 @@ const loadAttractionPhotos = async () => {
 
   tripPlan.value.days.forEach(day => {
     day.attractions.forEach(attraction => {
-      const promise = fetch(`http://localhost:8000/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
+      // 高德已经返回了实景图(https),无需再走 Unsplash
+      if (attraction.image_url) return
+
+      const promise = fetch(`${API_BASE_URL}/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
         .then(res => res.json())
         .then(data => {
-          if (data.success && data.data.photo_url) {
+          if (data.success && data.data?.photo_url) {
             attractionPhotos.value[attraction.name] = data.data.photo_url
           }
         })
@@ -460,9 +499,16 @@ const loadAttractionPhotos = async () => {
   await Promise.all(promises)
 }
 
-// 获取景点图片
-const getAttractionImage = (name: string, index: number): string => {
-  // 如果已加载真实图片,返回真实图片
+// 获取景点图片: 优先高德实景图 > Unsplash > 渐变占位图
+const getAttractionImage = (attraction: any, index: number): string => {
+  const name = attraction?.name || ''
+
+  // 1. 高德 POI 实景图(后端已统一升级为 https)
+  if (attraction?.image_url) {
+    return attraction.image_url
+  }
+
+  // 2. Unsplash 兜底图
   if (attractionPhotos.value[name]) {
     return attractionPhotos.value[name]
   }
@@ -798,9 +844,19 @@ const exportAsPDF = async () => {
 
 // 初始化地图
 const initMap = async () => {
+  mapError.value = ''
+
+  const jsKey = import.meta.env.VITE_AMAP_WEB_JS_KEY
+  if (!jsKey) {
+    // 没有 JS API Key 时回退到高德栅格瓦片地图(无需 Key)
+    mapError.value = '未配置 VITE_AMAP_WEB_JS_KEY，当前使用高德栅格瓦片地图；如需交互式地图，请在 frontend/.env.local 配置高德「Web端(JS API)」Key'
+    console.warn('[Result] 缺少 VITE_AMAP_WEB_JS_KEY, 使用栅格瓦片地图兜底')
+    return
+  }
+
   try {
     const AMap = await AMapLoader.load({
-      key: import.meta.env.VITE_AMAP_WEB_JS_KEY,  // 高德地图Web端(JS API) Key
+      key: jsKey,  // 高德地图Web端(JS API) Key
       version: '2.0',
       plugins: ['AMap.Marker', 'AMap.Polyline', 'AMap.InfoWindow']
     })
@@ -815,9 +871,16 @@ const initMap = async () => {
     // 添加景点标记
     addAttractionMarkers(AMap)
 
+    // 容器在布局稳定后尺寸才确定, 需手动 resize 一次, 否则可能渲染为空白
+    setTimeout(() => {
+      map?.resize?.()
+      map?.setFitView?.()
+    }, 200)
+
     message.success('地图加载成功')
   } catch (error) {
     console.error('地图加载失败:', error)
+    mapError.value = `地图加载失败：${(error as any)?.message || '未知错误'}，请检查 VITE_AMAP_WEB_JS_KEY 是否有效及域名是否已加入高德白名单`
     message.error('地图加载失败')
   }
 }
@@ -1231,6 +1294,26 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
 .map-card :deep(.ant-card-body) {
   height: calc(100% - 57px);
   padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 地图容器: 高度不足时也能撑开, 避免出现整块空白 */
+.amap-container {
+  width: 100%;
+  height: 100%;
+  min-height: 460px;
+  flex: 1;
+}
+
+.map-alert {
+  margin: 12px;
+}
+
+.tile-map-wrapper {
+  flex: 1;
+  min-height: 460px;
+  position: relative;
 }
 
 /* 每日行程卡片 */

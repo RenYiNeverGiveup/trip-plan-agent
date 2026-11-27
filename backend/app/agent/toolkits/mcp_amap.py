@@ -16,6 +16,7 @@ import os
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
+from ...logging_config import Timer, dumps
 from ..registry import ToolRegistry, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -151,10 +152,18 @@ class McpAmapProvider:
         if self._session is None:
             raise RuntimeError("MCP 连接未建立")
 
+        timer = Timer()
+        logger.info("→ MCP 工具调用 %s args=%s", name, dumps(arguments, 500))
         result = await self._session.call_tool(name, arguments)
 
         structured = getattr(result, "structuredContent", None)
         if structured:
+            logger.info(
+                "← MCP 工具返回 %s elapsed=%.0fms data=%s",
+                name,
+                timer.elapsed_ms,
+                dumps(structured, 800),
+            )
             return structured
 
         texts: List[str] = []
@@ -163,6 +172,13 @@ class McpAmapProvider:
             if text:
                 texts.append(text)
         payload = "\n".join(texts).strip()
+
+        logger.info(
+            "← MCP 工具返回 %s elapsed=%.0fms data=%s",
+            name,
+            timer.elapsed_ms,
+            dumps(payload, 800),
+        )
 
         if not payload:
             return {}

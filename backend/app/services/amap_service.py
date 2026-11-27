@@ -9,11 +9,13 @@
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from ..config import get_settings
+from ..logging_config import Timer, log_http_request, log_http_response
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,36 @@ def _extract_price(raw: Any) -> int:
     return int(float(match.group())) if match else 0
 
 
+def _extract_temp(raw: Any) -> int:
+    """提取温度(保留负号): "-1" -> -1, "10" -> 10。"""
+    if raw is None:
+        return 0
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(raw))
+    return int(float(match.group())) if match else 0
+
+
+def _to_https(url: Optional[str]) -> Optional[str]:
+    """把图片地址升级为 https。
+
+    高德返回的配图有一半是 http://, 在 https 页面里会被浏览器按"混合内容"拦截,
+    导致图片不显示, 这里统一升级为 https。
+    """
+    if not url:
+        return url
+    if url.startswith("http://"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+class AmapBusinessError(RuntimeError):
+    """高德返回的业务错误(status != 1), 例如权限不足、参数非法、密钥无效。
+
+    这类错误重试没有意义, 因此与网络错误区分开, 不参与重试。
+    """
+
+
 class AmapClient:
     """高德地图 Web 服务客户端(异步)。"""
 
@@ -62,6 +94,42 @@ class AmapClient:
             timeout=timeout,
             headers={"User-Agent": "trip-plan-agent/1.0"},
             limits=httpx.Limits(max_connections=pool_size),
+            event_hooks={"request": [self._on_request], "response": [self._on_response]},
+        )
+
+    # ------------------------------------------------------------------ #
+    # 第三方调用日志(httpx 事件钩子, 所有请求一处覆盖)
+    # ------------------------------------------------------------------ #
+    async def _on_request(self, request: httpx.Request) -> None:
+        """打印请求入参(含参数, key 已脱敏)。
+
+        注意: httpx 的 AsyncClient 会 `await hook(...)`, 因此钩子必须是协程函数。
+        """
+        request.extensions["_start_time"] = time.perf_counter()
+        params = dict(request.url.params)
+        log_http_request(logger, request.method, str(request.url), params)
+
+    async def _on_response(self, response: httpx.Response) -> None:
+        """打印响应出参(状态码、耗时、响应体摘要)。"""
+        start = response.request.extensions.get("_start_time")
+        elapsed_ms = (time.perf_counter() - start) * 1000 if start else None
+        body: Any = None
+        try:
+            # 响应体可能尚未读取, 先读取再解析
+            await response.aread()
+            body = response.json()
+        except Exception:  # noqa: BLE001 - 非 JSON 响应退化为文本
+            try:
+                body = response.text
+            except Exception:  # noqa: BLE001
+                body = None
+        log_http_response(
+            logger,
+            response.request.method,
+            str(response.request.url),
+            response.status_code,
+            body,
+            elapsed_ms,
         )
 
     async def aclose(self) -> None:
@@ -76,8 +144,14 @@ class AmapClient:
                 response.raise_for_status()
                 payload = response.json()
                 if payload.get("status") != "1":
-                    raise RuntimeError(f"高德接口 {path} 返回失败: {payload.get('info', '未知错误')}")
+                    # 业务错误(权限不足 / 参数错误 / 配额超限)重试没有意义, 直接抛出
+                    raise AmapBusinessError(
+                        f"高德接口 {path} 返回失败: {payload.get('info', '未知错误')} "
+                        f"(infocode={payload.get('infocode', '-')})"
+                    )
                 return payload
+            except AmapBusinessError:
+                raise
             except Exception as exc:  # noqa: BLE001 - 网络类错误统一重试
                 last_error = exc
                 if attempt < 2:
@@ -140,7 +214,7 @@ class AmapClient:
         detail = self._normalize_poi(poi)
         biz_ext = poi.get("biz_ext") or {}
         detail["ticket_price"] = _extract_price(biz_ext.get("ticket_price")) or _extract_price(poi.get("cost"))
-        detail["photos"] = [p.get("url") for p in (poi.get("photos") or []) if p.get("url")]
+        detail["photos"] = [_to_https(p.get("url")) for p in (poi.get("photos") or []) if p.get("url")]
         detail["business_area"] = poi.get("business_area")
         detail["tag"] = poi.get("tag") or biz_ext.get("tag")
         return detail
@@ -171,12 +245,20 @@ class AmapClient:
     # 天气
     # ------------------------------------------------------------------ #
     async def weather(self, city: str) -> List[Dict[str, Any]]:
-        """天气预报。高德最多返回 4 天(今天起)。"""
+        """天气预报。高德最多返回 4 天(今天起)。
+
+        注意: 高德返回的逐日数组字段名是 `casts`(不是 `forecast`)。
+        """
         payload = await self._get("/weather/weatherInfo", {"city": city, "extensions": "all"})
         forecasts = payload.get("forecasts") or []
         if not forecasts:
+            logger.warning("高德天气返回为空: city=%s payload=%s", city, list(payload.keys()))
             return []
-        days = forecasts[0].get("forecast") or []
+        # 高德实际字段为 casts, 兼容个别版本返回 forecast
+        days = forecasts[0].get("casts") or forecasts[0].get("forecast") or []
+        if not days:
+            logger.warning("高德天气未返回逐日预报: city=%s", city)
+            return []
         result: List[Dict[str, Any]] = []
         for day in days:
             result.append(
@@ -185,14 +267,15 @@ class AmapClient:
                     "week": day.get("week", ""),
                     "day_weather": day.get("dayweather", ""),
                     "night_weather": day.get("nightweather", ""),
-                    "day_temp": _extract_price(day.get("daytemp")),
-                    "night_temp": _extract_price(day.get("nighttemp")),
+                    "day_temp": _extract_temp(day.get("daytemp")),
+                    "night_temp": _extract_temp(day.get("nighttemp")),
                     "wind_direction": day.get("daywind", ""),
                     "wind_power": day.get("daypower", ""),
                     "night_wind_direction": day.get("nightwind", ""),
                     "night_wind_power": day.get("nightpower", ""),
                 }
             )
+        logger.info("高德天气解析成功: city=%s 天数=%s", city, len(result))
         return result
 
     # ------------------------------------------------------------------ #
@@ -218,33 +301,51 @@ class AmapClient:
         destination: Tuple[float, float],
         mode: str = "walking",
         city: Optional[str] = None,
+        origin_poi_id: Optional[str] = None,
+        destination_poi_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """两点间路径规划, 返回距离(米)与耗时(秒)。失败返回 None。"""
-        origin_str = f"{origin[0]},{origin[1]}"
-        destination_str = f"{destination[0]},{destination[1]}"
+        """两点间路径规划, 返回距离(米)与耗时(秒)。失败返回 None。
+
+        按高德 Web 服务文档(https://lbs.amap.com/api/webservice/guide/api/direction):
+        - 步行: `/direction/walking`
+        - 驾车: `/direction/driving` —— `extensions` 必填, `strategy` 建议 10(躲避拥堵且路程较短)
+        - 公交: `/direction/transit/integrated` —— `city` 必填(城市名或 citycode),
+          `cityd` 仅跨城规划时必填
+        """
+        origin_str = f"{origin[0]:.6f},{origin[1]:.6f}"
+        destination_str = f"{destination[0]:.6f},{destination[1]:.6f}"
+        params: Dict[str, Any] = {"origin": origin_str, "destination": destination_str}
+        # 已知 POI ID 时带上, 可以显著提升路径匹配准确度
+        if origin_poi_id:
+            params["origin_id"] = origin_poi_id
+        if destination_poi_id:
+            params["destination_id"] = destination_poi_id
+
         try:
             if mode == "driving":
                 payload = await self._get(
                     "/direction/driving",
-                    {"origin": origin_str, "destination": destination_str, "strategy": 0},
+                    {**params, "extensions": "base", "strategy": 10},
                 )
             elif mode == "transit":
                 if not city:
+                    logger.warning("公交路径规划缺少 city 参数, 已跳过")
                     return None
                 payload = await self._get(
-                    "/direction/transit",
-                    {"origin": origin_str, "destination": destination_str, "city": city, "cityd": city},
+                    "/direction/transit/integrated",
+                    {**params, "city": city, "extensions": "base", "strategy": 0},
                 )
             else:
-                payload = await self._get(
-                    "/direction/walking",
-                    {"origin": origin_str, "destination": destination_str},
-                )
-        except Exception as exc:  # noqa: BLE001
+                payload = await self._get("/direction/walking", params)
+        except Exception as exc:  # noqa: BLE001 - 路径规划失败时退回直线距离估算
             logger.warning("路径规划失败(mode=%s): %s", mode, exc)
             return None
 
-        paths = (payload.get("route") or {}).get("paths") or []
+        route = payload.get("route") or {}
+        if mode == "transit":
+            return self._parse_transit(route, mode)
+
+        paths = route.get("paths") or []
         if not paths:
             return None
         path = paths[0]
@@ -253,6 +354,37 @@ class AmapClient:
             "duration_s": int(path.get("duration") or 0),
             "mode": mode,
         }
+
+    @staticmethod
+    def _parse_transit(route: Dict[str, Any], mode: str) -> Optional[Dict[str, Any]]:
+        """解析公交路径规划结果。
+
+        `/direction/transit/integrated` 返回的是 `route.transits[]`,
+        每一段方案包含 duration/cost 与 segments[], 距离需要自行累加
+        (segments 里的 walking / bus / railway 各自带 distance)。
+        """
+        transits = route.get("transits") or []
+        if not transits:
+            return None
+
+        best: Optional[Dict[str, Any]] = None
+        for transit in transits:
+            distance = 0
+            for segment in transit.get("segments") or []:
+                for part in ("walking", "bus", "railway"):
+                    distance += int((segment.get(part) or {}).get("distance") or 0)
+            duration = int(transit.get("duration") or 0)
+            if best is None or duration < best["duration_s"]:
+                best = {
+                    "distance_m": distance,
+                    "duration_s": duration,
+                    "mode": mode,
+                }
+
+        if best and not best["distance_m"]:
+            # 兜底: 某些响应把总距离放在 route.distance
+            best["distance_m"] = int(route.get("distance") or 0)
+        return best
 
 
 # ---------------------------------------------------------------------- #

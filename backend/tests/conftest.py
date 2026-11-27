@@ -97,7 +97,8 @@ class FakeAmapClient:
             },
         ]
 
-    async def route(self, origin, destination, mode: str = "walking", city: Optional[str] = None):
+    async def route(self, origin, destination, mode: str = "walking", city: Optional[str] = None,
+                    origin_poi_id: Optional[str] = None, destination_poi_id: Optional[str] = None):
         self.route_calls += 1
         import math
 

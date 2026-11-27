@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..agent.executor import Agent
+from ..logging_config import Timer
 from ..agent.llm import LLMClient
 from ..agent.orchestrator import run_parallel
 from ..agent.registry import ToolRegistry
@@ -135,6 +136,7 @@ class MultiAgentTripPlanner:
         """生成旅行计划。"""
         await self.ensure_tools()
 
+        total_timer = Timer()
         logger.info(
             "开始规划: %s %s-%s (%s天)",
             request.city,
@@ -144,6 +146,7 @@ class MultiAgentTripPlanner:
         )
 
         # ---------- 阶段A: 并行采集 ----------
+        stage_timer = Timer()
         results = await run_parallel(
             {
                 "attractions": lambda: self._collect_attractions(request),
@@ -160,12 +163,27 @@ class MultiAgentTripPlanner:
             raise TripPlanningError(
                 "未能获取到任何景点数据, 请检查 AMAP_API_KEY 与网络连通性"
             )
+        logger.info(
+            "阶段A完成 耗时=%.1fs 景点=%s 酒店=%s 天气天数=%s",
+            stage_timer.elapsed,
+            len(attractions),
+            len(hotels),
+            len(weather),
+        )
 
         # ---------- 阶段B: 规划选择 ----------
+        stage_timer = Timer()
         selection = await self._plan_days(request, attractions, hotels, weather)
+        logger.info(
+            "阶段B完成 耗时=%.1fs 天数=%s",
+            stage_timer.elapsed,
+            len(selection.days),
+        )
 
         # ---------- 阶段C/D: 组装每日行程 ----------
+        stage_timer = Timer()
         days = await self._build_days(request, selection, attractions, hotels)
+        logger.info("阶段C/D完成 耗时=%.1fs 每日景点数=%s", stage_timer.elapsed, [len(d.attractions) for d in days])
 
         dates = self._build_dates(request)
         plan = TripPlan(
@@ -178,7 +196,7 @@ class MultiAgentTripPlanner:
             or "行程基于高德地图真实 POI 生成, 出发前请再次确认开放时间与票价。",
             budget=compute_budget(days),
         )
-        logger.info("行程生成完成: %s", request.city)
+        logger.info("行程生成完成: %s 总耗时=%.1fs", request.city, total_timer.elapsed)
         return plan
 
     @staticmethod
@@ -422,7 +440,13 @@ class MultiAgentTripPlanner:
             route = optimize_route(items, start_location)
             ordered = [items[i] for i in route["order"]] or items
 
-            distance_km, duration_min = await self._measure_legs(ordered, start_location, mode, request.city)
+            distance_km, duration_min = await self._measure_legs(
+                ordered,
+                start_location,
+                mode,
+                request.city,
+                start_poi_id=hotel.get("id") if hotel else None,
+            )
             cost = estimate_cost(mode, distance_km)
 
             day_meals = self._build_meals(meal_map.get(day_index), meal_candidates.get(day_index, []))
@@ -650,25 +674,37 @@ class MultiAgentTripPlanner:
         start: Optional[Dict[str, Any]],
         mode: str,
         city: str,
+        start_poi_id: Optional[str] = None,
     ) -> Tuple[float, int]:
         """测量当天各段距离与耗时(优先使用高德路径规划)。"""
         path: List[Tuple[float, float]] = []
+        poi_ids: List[Optional[str]] = []
         if start:
             path.append((float(start["longitude"]), float(start["latitude"])))
+            poi_ids.append(start_poi_id)
         for item in attractions:
             location = item.get("location") or {}
             path.append(
                 (float(location.get("longitude") or 0.0), float(location.get("latitude") or 0.0))
             )
+            poi_ids.append(item.get("id"))
         if start and len(path) > 1:
             path.append(path[0])  # 返回住处
+            poi_ids.append(start_poi_id)
 
         total_km = 0.0
         total_min = 0.0
 
         for index in range(len(path) - 1):
             origin, destination = path[index], path[index + 1]
-            result = await self.amap.route(origin, destination, mode=mode, city=city)
+            result = await self.amap.route(
+                origin,
+                destination,
+                mode=mode,
+                city=city,
+                origin_poi_id=poi_ids[index] if index < len(poi_ids) else None,
+                destination_poi_id=poi_ids[index + 1] if index + 1 < len(poi_ids) else None,
+            )
             if result and result.get("distance_m"):
                 total_km += result["distance_m"] / 1000.0
                 total_min += result.get("duration_s", 0) / 60.0

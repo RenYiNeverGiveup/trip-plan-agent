@@ -104,12 +104,12 @@ async def get_attraction_photo(name: str):
     try:
         unsplash_service = get_unsplash_service()
 
-        # 搜索景点图片
-        photo_url = await unsplash_service.get_photo_url(f"{name} China landmark")
+        # 搜索景点名称图片
+        photo_url = await unsplash_service.get_photo_url(name)
 
         if not photo_url:
-            # 如果没找到,尝试只用景点名称搜索
-            photo_url = await unsplash_service.get_photo_url(name)
+            # 如果没找到,尝试用景点搜索
+            photo_url = await unsplash_service.get_photo_url(f"{name} China landmark")
 
         return {
             "success": True,
